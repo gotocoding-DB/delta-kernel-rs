@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
@@ -14,77 +14,108 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-/// Iterator wrapper that emits metrics when exhausted
-struct ListMetricsIterator<I> {
+/// Trait for collecting metrics during iteration.
+///
+/// Different implementations track different statistics based on the operation type.
+trait MetricsCollector: Sized {
+    type Item;
+
+    /// Called for each successful item to collect per-item statistics.
+    fn collect(&mut self, item: &Self::Item);
+
+    /// Called when iterator is exhausted or dropped to emit metrics.
+    /// The item_count is tracked by the iterator itself.
+    fn emit(&self, reporter: &dyn MetricsReporter, duration: Duration, item_count: u64);
+}
+
+/// Collector for list operations (FileMeta iteration).
+struct ListCollector;
+
+impl MetricsCollector for ListCollector {
+    type Item = FileMeta;
+
+    fn collect(&mut self, _item: &FileMeta) {
+        // No per-item work needed for listing
+    }
+
+    fn emit(&self, reporter: &dyn MetricsReporter, duration: Duration, item_count: u64) {
+        reporter.report(MetricEvent::StorageListCompleted {
+            duration,
+            num_files: item_count,
+        });
+    }
+}
+
+/// Collector for read operations (Bytes iteration).
+struct ReadCollector {
+    bytes_read: u64,
+}
+
+impl MetricsCollector for ReadCollector {
+    type Item = Bytes;
+
+    fn collect(&mut self, bytes: &Bytes) {
+        self.bytes_read += bytes.len() as u64;
+    }
+
+    fn emit(&self, reporter: &dyn MetricsReporter, duration: Duration, item_count: u64) {
+        reporter.report(MetricEvent::StorageReadCompleted {
+            duration,
+            num_files: item_count,
+            bytes_read: self.bytes_read,
+        });
+    }
+}
+
+/// Unified iterator wrapper that emits metrics when exhausted or dropped.
+struct MetricsIterator<I, C: MetricsCollector> {
     inner: I,
     reporter: Option<Arc<dyn MetricsReporter>>,
     start: Instant,
-    count: u64,
+    collector: C,
+    item_count: u64,
     metrics_emitted: bool,
 }
 
-impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator<I> {
-    type Item = DeltaResult<FileMeta>;
+impl<I, C: MetricsCollector> MetricsIterator<I, C> {
+    /// Emit metrics once, ensuring no double reporting.
+    fn emit_metrics_once(&mut self) {
+        if !self.metrics_emitted {
+            self.reporter.as_ref().inspect(|r| {
+                self.collector.emit(r.as_ref(), self.start.elapsed(), self.item_count);
+            });
+            self.metrics_emitted = true;
+        }
+    }
+}
+
+impl<I, C> Iterator for MetricsIterator<I, C>
+where
+    I: Iterator<Item = DeltaResult<C::Item>>,
+    C: MetricsCollector,
+{
+    type Item = DeltaResult<C::Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next() {
             Some(item) => {
-                if item.is_ok() {
-                    self.count += 1;
+                if let Ok(ref value) = item {
+                    self.item_count += 1;
+                    self.collector.collect(value);
                 }
                 Some(item)
             }
             None => {
-                if !self.metrics_emitted {
-                    self.reporter.as_ref().inspect(|r| {
-                        r.report(MetricEvent::StorageListCompleted {
-                            duration: self.start.elapsed(),
-                            num_files: self.count,
-                        });
-                    });
-                    self.metrics_emitted = true;
-                }
+                self.emit_metrics_once();
                 None
             }
         }
     }
 }
 
-/// Iterator wrapper for read operations that tracks bytes read
-struct ReadMetricsIterator<I> {
-    inner: I,
-    reporter: Option<Arc<dyn MetricsReporter>>,
-    start: Instant,
-    num_files: u64,
-    bytes_read: u64,
-    metrics_emitted: bool,
-}
-
-impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I> {
-    type Item = DeltaResult<Bytes>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next() {
-            Some(item) => {
-                if let Ok(ref bytes) = item {
-                    self.bytes_read += bytes.len() as u64;
-                }
-                Some(item)
-            }
-            None => {
-                if !self.metrics_emitted {
-                    self.reporter.as_ref().inspect(|r| {
-                        r.report(MetricEvent::StorageReadCompleted {
-                            duration: self.start.elapsed(),
-                            num_files: self.num_files,
-                            bytes_read: self.bytes_read,
-                        });
-                    });
-                    self.metrics_emitted = true;
-                }
-                None
-            }
-        }
+impl<I, C: MetricsCollector> Drop for MetricsIterator<I, C> {
+    fn drop(&mut self) {
+        self.emit_metrics_once();
     }
 }
 
@@ -206,11 +237,12 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
             Ok(Box::new(fms.into_iter().map(Ok)))
         } else {
-            Ok(Box::new(ListMetricsIterator {
+            Ok(Box::new(MetricsIterator {
                 inner: receiver.into_iter(),
                 reporter,
                 start,
-                count: 0,
+                collector: ListCollector,
+                item_count: 0,
                 metrics_emitted: false,
             }))
         }
@@ -227,7 +259,6 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let store = self.inner.clone();
-        let num_files = files.len() as u64;
 
         // This channel will become the output iterator.
         // Because there will already be buffering in the stream, we set the
@@ -274,12 +305,12 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                 }),
         );
 
-        Ok(Box::new(ReadMetricsIterator {
+        Ok(Box::new(MetricsIterator {
             inner: receiver.into_iter(),
             reporter: self.reporter.clone(),
             start: Instant::now(),
-            num_files,
-            bytes_read: 0,
+            collector: ReadCollector { bytes_read: 0 },
+            item_count: 0,
             metrics_emitted: false,
         }))
     }
