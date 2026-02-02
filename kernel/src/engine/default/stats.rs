@@ -529,7 +529,8 @@ pub(crate) fn collect_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{Array, Int64Array, StringArray};
+    use crate::arrow::array::{Array, Int32Array, Int64Array, StringArray};
+    use crate::arrow::buffer::NullBuffer;
     use crate::arrow::datatypes::{Fields, Schema};
     use crate::expressions::column_name;
 
@@ -1164,5 +1165,98 @@ mod tests {
             .unwrap();
         assert!(max_values.column_by_name("id").is_some());
         assert!(max_values.column_by_name("list_col").is_none());
+    }
+
+    #[test]
+    fn test_collect_stats_struct_with_nulls_at_struct_level() {
+        // Schema: { my_struct: { a: int32, b: int32 (nullable) } }
+        // Test both struct-level nulls and field-level nulls
+        let child_fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true), // Now nullable
+        ]);
+
+        let a_values = Int32Array::from(vec![1, 2, 3, 4]);
+        // b has field-level nulls at rows 0 and 2
+        let b_values = Int32Array::from(vec![None, Some(20), None, Some(40)]);
+
+        // Nulls at struct level: [false, true, true, false]
+        // This means rows 1 and 2 have null structs (entire struct is null)
+        let nulls = NullBuffer::from(vec![false, true, true, false]);
+
+        let struct_array = StructArray::new(
+            child_fields.clone(),
+            vec![Arc::new(a_values), Arc::new(b_values)],
+            Some(nulls),
+        );
+
+        let schema = Schema::new(vec![Field::new(
+            "my_struct",
+            DataType::Struct(child_fields),
+            true,
+        )]);
+
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("my_struct")]).unwrap();
+
+        // Check null counts for child fields
+        // Is it expected? column 'a' has no field-level nulls, and rows 0 and 2 are null at struct level
+        assert_eq!(
+            get_stat::<Int64Type>(&stats, "nullCount", "my_struct", "a"),
+            0
+        );
+        assert_eq!(
+            get_stat::<Int64Type>(&stats, "nullCount", "my_struct", "b"),
+            2
+        );
+
+        // Check minValues
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "minValues", "my_struct", "a"),
+            1
+        );
+        // Is it expected? It's marked with NULL for 20 at higher level. Shouldn't be 40?
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "minValues", "my_struct", "b"),
+            20
+        );
+
+        // Check maxValues
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "a"),
+            4
+        );
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "b"),
+            40
+        );
+    }
+
+    // Generic helper to extract and downcast nested columns from stats
+    fn get_stat<T>(
+        stats: &StructArray,
+        stat_name: &str,
+        struct_name: &str,
+        field_name: &str,
+    ) -> T::Native
+    where
+        T: crate::arrow::datatypes::ArrowPrimitiveType,
+    {
+        stats
+            .column_by_name(stat_name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name(struct_name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name(field_name)
+            .unwrap()
+            .as_primitive::<T>()
+            .value(0)
     }
 }
